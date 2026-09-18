@@ -2,25 +2,30 @@
 
 ## Il problema
 
-Dopo la connessione alla VPN aziendale (OpenVPN), Brave non riesce a raggiungere i siti interni (Bitbucket, Jira, Confluence, ecc.) mostrando:
+Dopo la connessione alla VPN aziendale (OpenVPN), i browser basati su Chromium (Brave, Chrome, Edge, Vivaldi, Opera) non riescono a raggiungere i siti interni mostrando:
 
 ```
 ERR_TIMED_OUT
-bitbucket.sanmarcoweb.com ha impiegato troppo tempo a rispondere.
+<sito-interno> ha impiegato troppo tempo a rispondere.
 ```
 
-Mentre `curl`, `ping` e altri browser funzionano normalmente.
+Mentre `curl`, `ping` e Firefox funzionano normalmente.
 
 ## Causa
 
-Brave (e tutti i browser basati su Chromium) inviano un **TLS Client Hello molto grande** rispetto ad altri client, perché includono estensioni post-quantum (ML-KEM/Kyber) e molte cipher suite.
+I browser basati su Chromium recenti (v124+) inviano un **TLS Client Hello molto grande** rispetto ad altri client, perché includono estensioni post-quantum (ML-KEM/Kyber) e molte cipher suite.
 
 Questo pacchetto, una volta incapsulato dal tunnel VPN, supera la MTU del percorso di rete e viene **silenziosamente scartato** (PMTU black hole). I pacchetti piccoli passano, quelli grandi no: il risultato è un timeout.
 
 ### Diagnosi con tcpdump
 
+```bash
+sudo tcpdump -i tun0 host <ip-server> -c 20
 ```
-# Il segmento da 1368 byte viene ritrasmesso all'infinito, mai ricevuto dal server
+
+Output tipico del problema — il segmento da 1368 byte viene ritrasmesso all'infinito:
+
+```
 11:11:35.111751 IP client > server.https: Flags [.], seq 1:1369, length 1368
 11:11:35.245200 IP server > client.https: Flags [.], ack 1, sack 1 {1369:1744}  # riceve solo il frammento piccolo
 11:11:35.245244 IP client > server.https: Flags [.], seq 1:1369, length 1368     # ritrasmissione
@@ -30,34 +35,31 @@ Questo pacchetto, una volta incapsulato dal tunnel VPN, supera la MTU del percor
 
 ## Soluzione
 
-Ridurre la MTU dell'interfaccia tunnel a 1280 byte:
+### Fix immediato (temporaneo, vale fino alla prossima riconnessione)
 
 ```bash
 sudo ip link set dev tun0 mtu 1280
 ```
 
-Questo forza TCP a negoziare segmenti più piccoli che passano senza problemi attraverso il tunnel.
+### Fix permanente (consigliato)
 
-### Applicazione permanente
-
-Aggiungi il comando nello script di avvio della VPN, subito dopo la connessione riuscita, oppure nel file `.ovpn`:
-
-**Opzione A** — nello script di connessione:
-
-```bash
-# Dopo "Initialization Sequence Completed"
-sudo ip link set dev tun0 mtu 1280
-```
-
-**Opzione B** — nel file `.ovpn` del client:
+Aggiungi questa riga al file `.ovpn` del client:
 
 ```
 tun-mtu 1280
 ```
 
-**Opzione C** — con un hook `up` di OpenVPN:
+Alla prossima connessione OpenVPN imposterà la MTU automaticamente.
 
-Crea `/etc/openvpn/client/fix-mtu.sh`:
+### Alternative
+
+**Nello script di connessione** — se usi uno script custom per avviare la VPN, aggiungi dopo la connessione riuscita:
+
+```bash
+sudo ip link set dev tun0 mtu 1280
+```
+
+**Con un hook `up` di OpenVPN** — crea uno script (es. `/etc/openvpn/client/fix-mtu.sh`):
 
 ```bash
 #!/bin/bash
@@ -75,9 +77,9 @@ script-security 2
 up /etc/openvpn/client/fix-mtu.sh
 ```
 
-## Nota su Brave installato come Snap
+## Nota su Brave installato come Snap (Ubuntu)
 
-Se Brave è installato come Snap, potrebbe non vedere l'interfaccia `tun0` della VPN per via della sandbox. In quel caso conviene installare la versione APT:
+Se Brave è installato come Snap, potrebbe non vedere l'interfaccia `tun0` per via della sandbox. In quel caso conviene installare la versione APT:
 
 ```bash
 sudo snap remove brave
@@ -86,18 +88,34 @@ echo "deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg] http
 sudo apt update && sudo apt install -y brave-browser
 ```
 
-## Colpisce anche Chrome, Edge, Vivaldi?
+## Browser colpiti
 
-Si, qualsiasi browser basato su Chromium recente (v124+) che include le estensioni TLS post-quantum. Firefox non è colpito perché il suo Client Hello è più piccolo.
+| Browser | Colpito? | Note |
+|---------|----------|------|
+| Brave   | Si | Client Hello post-quantum molto grande |
+| Chrome  | Si | Stesso engine di Brave |
+| Edge    | Si | Chromium-based |
+| Vivaldi | Si | Chromium-based |
+| Opera   | Si | Chromium-based |
+| Firefox | No | Client Hello più piccolo, non include ML-KEM |
+
+## Script di utilità
+
+Il repo include `fix-mtu.sh` per applicare il fix al volo:
+
+```bash
+sudo ./fix-mtu.sh          # default: MTU 1280 su tun0
+sudo ./fix-mtu.sh 1300     # MTU custom
+sudo ./fix-mtu.sh 1280 tun1  # interfaccia diversa
+```
 
 ## Verifica
 
 ```bash
-# Prima del fix
-sudo tcpdump -i tun0 host <ip-server> -c 20
-# Vedrai ritrasmissioni infinite del segmento grande
+# Controlla la MTU attuale
+ip link show tun0 | grep mtu
 
-# Dopo il fix
-curl -sI https://bitbucket.sanmarcoweb.com
-# HTTP/2 302 — funziona
+# Testa la connessione
+curl -sI https://<sito-interno>
+# HTTP/2 302 → funziona
 ```
